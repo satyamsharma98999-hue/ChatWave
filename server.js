@@ -6,163 +6,259 @@ const os = require('os');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' }
-});
+const io = new Server(server, { cors: { origin: '*' } });
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ============================================================
-//   IN-MEMORY DATABASE
-//   (Data server restart tak rahega)
+//  DATABASE (In-Memory)
 // ============================================================
-const users = {};    // uid -> { uid, name, color, pwHash, contacts[] }
-const messages = {}; // chatKey -> [msg, ...]
+// users[uid] = { uid, name, color, pwHash, bio, contacts[], blocked[], pendingIn[], pendingOut[], createdAt }
+const users = {};
+const messages = {}; // chatKey -> [msg]
 
 // ============================================================
-//   REST API
+//  HELPERS
 // ============================================================
+function safeUser(u) {
+  if (!u) return null;
+  return { uid: u.uid, name: u.name, color: u.color, bio: u.bio || '' };
+}
 
-// Check UID availability
+// ============================================================
+//  AUTH
+// ============================================================
 app.get('/api/check-uid/:uid', (req, res) => {
-  const uid = req.params.uid.toLowerCase();
-  res.json({ available: !users[uid] });
+  res.json({ available: !users[req.params.uid.toLowerCase()] });
 });
 
-// Signup
 app.post('/api/signup', (req, res) => {
   const { uid, name, color, pwHash } = req.body;
   if (!uid || !name || !pwHash) return res.json({ ok: false, msg: 'Missing fields' });
   if (!/^[a-zA-Z0-9_]{3,20}$/.test(uid)) return res.json({ ok: false, msg: 'Invalid User ID' });
   if (users[uid]) return res.json({ ok: false, msg: '❌ यह User ID पहले से ली हुई है' });
-  users[uid] = { uid, name, color, pwHash, contacts: [], createdAt: Date.now() };
-  console.log(`✅ New user: ${name} (@${uid})`);
+  users[uid] = { uid, name, color, pwHash, bio: '', contacts: [], blocked: [], pendingIn: [], pendingOut: [], createdAt: Date.now() };
+  console.log(`✅ Signup: @${uid} (${name})`);
   res.json({ ok: true });
 });
 
-// Login
 app.post('/api/login', (req, res) => {
   const { uid, pwHash } = req.body;
-  if (!uid || !pwHash) return res.json({ ok: false, msg: 'Missing fields' });
-  const u = users[uid.toLowerCase()];
-  if (!u) return res.json({ ok: false, msg: '❌ User ID नहीं मिला — पहले Sign Up करें' });
+  const u = users[uid?.toLowerCase()];
+  if (!u) return res.json({ ok: false, msg: '❌ User ID नहीं मिला' });
   if (u.pwHash !== pwHash) return res.json({ ok: false, msg: '❌ Password गलत है' });
-  res.json({ ok: true, user: { uid: u.uid, name: u.name, color: u.color, contacts: u.contacts } });
+  res.json({ ok: true, user: { uid: u.uid, name: u.name, color: u.color, bio: u.bio || '', contacts: u.contacts, blocked: u.blocked, pendingIn: u.pendingIn, pendingOut: u.pendingOut } });
 });
 
-// Add contact
-app.post('/api/add-contact', (req, res) => {
+// ============================================================
+//  SEARCH USERS
+// ============================================================
+app.get('/api/search', (req, res) => {
+  const { q, myUID } = req.query;
+  if (!q || q.length < 2) return res.json([]);
+  const query = q.toLowerCase();
+  const me = users[myUID];
+  const results = Object.values(users)
+    .filter(u => {
+      if (u.uid === myUID) return false;
+      if (me && me.blocked.includes(u.uid)) return false;
+      return u.uid.includes(query) || u.name.toLowerCase().includes(query);
+    })
+    .slice(0, 15)
+    .map(u => ({
+      ...safeUser(u),
+      isContact: me ? me.contacts.includes(u.uid) : false,
+      isBlocked: me ? me.blocked.includes(u.uid) : false,
+      isPendingOut: me ? me.pendingOut.includes(u.uid) : false,
+      isPendingIn: me ? me.pendingIn.includes(u.uid) : false,
+    }));
+  res.json(results);
+});
+
+// Get all users (for browse)
+app.get('/api/users', (req, res) => {
+  const { myUID } = req.query;
+  const me = users[myUID];
+  const list = Object.values(users)
+    .filter(u => u.uid !== myUID && !(me && me.blocked.includes(u.uid)))
+    .map(u => ({
+      ...safeUser(u),
+      isContact: me ? me.contacts.includes(u.uid) : false,
+      isPendingOut: me ? me.pendingOut.includes(u.uid) : false,
+      isPendingIn: me ? me.pendingIn.includes(u.uid) : false,
+    }));
+  res.json(list);
+});
+
+// Get user profile
+app.get('/api/profile/:uid', (req, res) => {
+  const u = users[req.params.uid.toLowerCase()];
+  if (!u) return res.json({ ok: false });
+  res.json({ ok: true, user: safeUser(u) });
+});
+
+// Update profile (name, bio, color)
+app.post('/api/update-profile', (req, res) => {
+  const { uid, name, bio, color } = req.body;
+  const u = users[uid];
+  if (!u) return res.json({ ok: false });
+  if (name) u.name = name.slice(0, 24);
+  if (bio !== undefined) u.bio = bio.slice(0, 80);
+  if (color) u.color = color;
+  // Notify contacts
+  (u.contacts || []).forEach(cid => {
+    const sock = onlineUsers[cid];
+    if (sock) io.to(sock).emit('profile-updated', safeUser(u));
+  });
+  res.json({ ok: true, user: safeUser(u) });
+});
+
+// ============================================================
+//  FRIEND REQUESTS
+// ============================================================
+
+// Send friend request
+app.post('/api/friend-request', (req, res) => {
+  const { fromUID, toUID } = req.body;
+  const from = users[fromUID]; const to = users[toUID];
+  if (!from || !to) return res.json({ ok: false, msg: 'User नहीं मिला' });
+  if (fromUID === toUID) return res.json({ ok: false, msg: 'खुद को add नहीं कर सकते' });
+  if (from.blocked.includes(toUID) || to.blocked.includes(fromUID)) return res.json({ ok: false, msg: 'Request नहीं भेज सकते' });
+  if (from.contacts.includes(toUID)) return res.json({ ok: false, msg: 'पहले से friend हैं' });
+  if (from.pendingOut.includes(toUID)) return res.json({ ok: false, msg: 'Request पहले से भेजी हुई है' });
+
+  // If they already sent me a request → auto accept
+  if (from.pendingIn.includes(toUID)) {
+    from.contacts.push(toUID); to.contacts.push(fromUID);
+    from.pendingIn = from.pendingIn.filter(x => x !== toUID);
+    to.pendingOut = to.pendingOut.filter(x => x !== fromUID);
+    // Notify both
+    const toSock = onlineUsers[toUID];
+    if (toSock) io.to(toSock).emit('friend-accepted', { uid: fromUID, user: safeUser(from) });
+    const fromSock = onlineUsers[fromUID];
+    if (fromSock) io.to(fromSock).emit('friend-accepted', { uid: toUID, user: safeUser(to) });
+    return res.json({ ok: true, accepted: true });
+  }
+
+  from.pendingOut.push(toUID);
+  to.pendingIn.push(fromUID);
+
+  // Real-time notification to receiver
+  const toSock = onlineUsers[toUID];
+  if (toSock) io.to(toSock).emit('friend-request', { from: safeUser(from) });
+
+  console.log(`📨 Friend request: @${fromUID} → @${toUID}`);
+  res.json({ ok: true, accepted: false });
+});
+
+// Accept friend request
+app.post('/api/accept-request', (req, res) => {
+  const { myUID, fromUID } = req.body;
+  const me = users[myUID]; const from = users[fromUID];
+  if (!me || !from) return res.json({ ok: false });
+  me.contacts.push(fromUID); from.contacts.push(myUID);
+  me.pendingIn = me.pendingIn.filter(x => x !== fromUID);
+  from.pendingOut = from.pendingOut.filter(x => x !== myUID);
+  // Notify sender
+  const fromSock = onlineUsers[fromUID];
+  if (fromSock) io.to(fromSock).emit('friend-accepted', { uid: myUID, user: safeUser(me) });
+  res.json({ ok: true });
+});
+
+// Decline / Cancel request
+app.post('/api/decline-request', (req, res) => {
+  const { myUID, fromUID } = req.body;
+  const me = users[myUID]; const from = users[fromUID];
+  if (me) me.pendingIn = me.pendingIn.filter(x => x !== fromUID);
+  if (from) from.pendingOut = from.pendingOut.filter(x => x !== myUID);
+  res.json({ ok: true });
+});
+
+// ============================================================
+//  BLOCK / UNBLOCK
+// ============================================================
+app.post('/api/block', (req, res) => {
   const { myUID, targetUID } = req.body;
-  const target = targetUID.toLowerCase();
-  if (!users[target]) return res.json({ ok: false, msg: '❌ User नहीं मिला — ID चेक करें' });
-  if (target === myUID) return res.json({ ok: false, msg: '❗ खुद को add नहीं कर सकते' });
-  const mu = users[myUID]; const tu = users[target];
-  if (!mu.contacts.includes(target)) mu.contacts.push(target);
-  if (!tu.contacts.includes(myUID)) tu.contacts.push(myUID);
-  res.json({ ok: true, targetUser: { uid: tu.uid, name: tu.name, color: tu.color } });
+  const me = users[myUID];
+  if (!me) return res.json({ ok: false });
+  if (!me.blocked.includes(targetUID)) me.blocked.push(targetUID);
+  // Remove from contacts both sides
+  me.contacts = me.contacts.filter(x => x !== targetUID);
+  const target = users[targetUID];
+  if (target) target.contacts = target.contacts.filter(x => x !== myUID);
+  res.json({ ok: true });
 });
 
-// Get contacts info
+app.post('/api/unblock', (req, res) => {
+  const { myUID, targetUID } = req.body;
+  const me = users[myUID];
+  if (!me) return res.json({ ok: false });
+  me.blocked = me.blocked.filter(x => x !== targetUID);
+  res.json({ ok: true });
+});
+
+// ============================================================
+//  CONTACTS & MESSAGES
+// ============================================================
 app.post('/api/contacts-info', (req, res) => {
   const { uids } = req.body;
   const info = {};
-  (uids || []).forEach(uid => { if (users[uid]) info[uid] = { uid: users[uid].uid, name: users[uid].name, color: users[uid].color }; });
+  (uids || []).forEach(uid => { if (users[uid]) info[uid] = safeUser(users[uid]); });
   res.json(info);
 });
 
-// Get chat history
 app.get('/api/history/:key', (req, res) => {
-  const msgs = (messages[req.params.key] || []).filter(m => !m.deleted);
-  res.json(msgs);
+  res.json((messages[req.params.key] || []).filter(m => !m.deleted));
 });
 
 // ============================================================
-//   SOCKET.IO — REAL-TIME
+//  SOCKET.IO
 // ============================================================
-const onlineUsers = {}; // uid -> socketId
+const onlineUsers = {};
 
 io.on('connection', socket => {
-
-  // User joins
-  socket.on('join', (uid) => {
+  socket.on('join', uid => {
     socket.uid = uid;
     onlineUsers[uid] = socket.id;
-    console.log(`🟢 Online: @${uid}`);
     io.emit('online-update', Object.keys(onlineUsers));
   });
 
-  // Send message
-  socket.on('send-msg', (data) => {
+  socket.on('send-msg', data => {
     const key = [data.from, data.to].sort().join('::');
     if (!messages[key]) messages[key] = [];
-    const msg = {
-      ...data,
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2),
-      ts: Date.now(),
-      deleted: false,
-      read: false
-    };
+    // Check block
+    const sender = users[data.from]; const receiver = users[data.to];
+    if (receiver && receiver.blocked && receiver.blocked.includes(data.from)) return;
+    const msg = { ...data, id: Date.now().toString(36) + Math.random().toString(36).slice(2), ts: Date.now(), deleted: false, read: false };
     messages[key].push(msg);
-
-    // Deliver to receiver if online
     const toSock = onlineUsers[data.to];
     if (toSock) {
       io.to(toSock).emit('new-msg', msg);
-      // Auto mark as read after 1s if receiver online
-      setTimeout(() => {
-        msg.read = true;
-        socket.emit('msg-read', { key, msgId: msg.id });
-      }, 1200);
+      setTimeout(() => { msg.read = true; socket.emit('msg-read', { key, msgId: msg.id }); }, 1200);
     }
-    // Confirm to sender
     socket.emit('msg-sent', msg);
   });
 
-  // Typing indicators
-  socket.on('typing', ({ to }) => {
-    const toSock = onlineUsers[to];
-    if (toSock) io.to(toSock).emit('typing', { from: socket.uid });
-  });
+  socket.on('typing', ({ to }) => { const s = onlineUsers[to]; if (s) io.to(s).emit('typing', { from: socket.uid }); });
+  socket.on('stop-typing', ({ to }) => { const s = onlineUsers[to]; if (s) io.to(s).emit('stop-typing', { from: socket.uid }); });
 
-  socket.on('stop-typing', ({ to }) => {
-    const toSock = onlineUsers[to];
-    if (toSock) io.to(toSock).emit('stop-typing', { from: socket.uid });
-  });
-
-  // Delete message
   socket.on('delete-msg', ({ key, msgId, to }) => {
-    const chat = messages[key] || [];
-    const m = chat.find(x => x.id === msgId);
+    const m = (messages[key] || []).find(x => x.id === msgId);
     if (m) m.deleted = true;
-    const toSock = onlineUsers[to];
-    if (toSock) io.to(toSock).emit('msg-deleted', { key, msgId });
+    const s = onlineUsers[to]; if (s) io.to(s).emit('msg-deleted', { key, msgId });
     socket.emit('msg-deleted', { key, msgId });
   });
 
-  // Disconnect
   socket.on('disconnect', () => {
-    if (socket.uid) {
-      delete onlineUsers[socket.uid];
-      console.log(`🔴 Offline: @${socket.uid}`);
-      io.emit('online-update', Object.keys(onlineUsers));
-    }
+    if (socket.uid) { delete onlineUsers[socket.uid]; io.emit('online-update', Object.keys(onlineUsers)); }
   });
 });
 
 // ============================================================
-//   START SERVER
+//  START
 // ============================================================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('\n🚀 ChatWave Server Started!');
-  console.log(`📡 Port: ${PORT}`);
-  console.log(`🌐 Local: http://localhost:${PORT}`);
-  // Show network IPs
-  const nets = os.networkInterfaces();
-  for (const list of Object.values(nets))
-    for (const n of list)
-      if (n.family === 'IPv4' && !n.internal)
-        console.log(`📱 Network: http://${n.address}:${PORT}`);
-  console.log('\n✅ Server ready!\n');
+  console.log(`\n🚀 ChatWave Server running on port ${PORT}\n`);
 });
