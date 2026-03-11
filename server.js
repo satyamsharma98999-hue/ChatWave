@@ -33,6 +33,17 @@ app.get('/api/check-uid/:uid', (req, res) => {
   res.json({ available: !users[req.params.uid.toLowerCase()] });
 });
 
+// Helper: ensure user has all fields (for old users)
+function fixUser(u) {
+  if (!u) return u;
+  if (!u.contacts) u.contacts = [];
+  if (!u.blocked) u.blocked = [];
+  if (!u.pendingIn) u.pendingIn = [];
+  if (!u.pendingOut) u.pendingOut = [];
+  if (!u.bio) u.bio = '';
+  return u;
+}
+
 app.post('/api/signup', (req, res) => {
   const { uid, name, color, pwHash } = req.body;
   if (!uid || !name || !pwHash) return res.json({ ok: false, msg: 'Missing fields' });
@@ -45,7 +56,7 @@ app.post('/api/signup', (req, res) => {
 
 app.post('/api/login', (req, res) => {
   const { uid, pwHash } = req.body;
-  const u = users[uid?.toLowerCase()];
+  const u = fixUser(users[uid?.toLowerCase()]);
   if (!u) return res.json({ ok: false, msg: '❌ User ID नहीं मिला' });
   if (u.pwHash !== pwHash) return res.json({ ok: false, msg: '❌ Password गलत है' });
   res.json({ ok: true, user: { uid: u.uid, name: u.name, color: u.color, bio: u.bio || '', contacts: u.contacts, blocked: u.blocked, pendingIn: u.pendingIn, pendingOut: u.pendingOut } });
@@ -58,7 +69,7 @@ app.get('/api/search', (req, res) => {
   const { q, myUID } = req.query;
   if (!q || q.length < 2) return res.json([]);
   const query = q.toLowerCase();
-  const me = users[myUID];
+  const me = fixUser(users[myUID]);
   const results = Object.values(users)
     .filter(u => {
       if (u.uid === myUID) return false;
@@ -79,7 +90,7 @@ app.get('/api/search', (req, res) => {
 // Get all users (for browse)
 app.get('/api/users', (req, res) => {
   const { myUID } = req.query;
-  const me = users[myUID];
+  const me = fixUser(users[myUID]);
   const list = Object.values(users)
     .filter(u => u.uid !== myUID && !(me && me.blocked.includes(u.uid)))
     .map(u => ({
@@ -121,7 +132,7 @@ app.post('/api/update-profile', (req, res) => {
 // Send friend request
 app.post('/api/friend-request', (req, res) => {
   const { fromUID, toUID } = req.body;
-  const from = users[fromUID]; const to = users[toUID];
+  const from = fixUser(users[fromUID]); const to = fixUser(users[toUID]);
   if (!from || !to) return res.json({ ok: false, msg: 'User नहीं मिला' });
   if (fromUID === toUID) return res.json({ ok: false, msg: 'खुद को add नहीं कर सकते' });
   if (from.blocked.includes(toUID) || to.blocked.includes(fromUID)) return res.json({ ok: false, msg: 'Request नहीं भेज सकते' });
@@ -155,7 +166,7 @@ app.post('/api/friend-request', (req, res) => {
 // Accept friend request
 app.post('/api/accept-request', (req, res) => {
   const { myUID, fromUID } = req.body;
-  const me = users[myUID]; const from = users[fromUID];
+  const me = fixUser(users[myUID]); const from = fixUser(users[fromUID]);
   if (!me || !from) return res.json({ ok: false });
   me.contacts.push(fromUID); from.contacts.push(myUID);
   me.pendingIn = me.pendingIn.filter(x => x !== fromUID);
@@ -169,7 +180,7 @@ app.post('/api/accept-request', (req, res) => {
 // Decline / Cancel request
 app.post('/api/decline-request', (req, res) => {
   const { myUID, fromUID } = req.body;
-  const me = users[myUID]; const from = users[fromUID];
+  const me = fixUser(users[myUID]); const from = fixUser(users[fromUID]);
   if (me) me.pendingIn = me.pendingIn.filter(x => x !== fromUID);
   if (from) from.pendingOut = from.pendingOut.filter(x => x !== myUID);
   res.json({ ok: true });
@@ -180,19 +191,18 @@ app.post('/api/decline-request', (req, res) => {
 // ============================================================
 app.post('/api/block', (req, res) => {
   const { myUID, targetUID } = req.body;
-  const me = users[myUID];
+  const me = fixUser(users[myUID]);
   if (!me) return res.json({ ok: false });
   if (!me.blocked.includes(targetUID)) me.blocked.push(targetUID);
-  // Remove from contacts both sides
   me.contacts = me.contacts.filter(x => x !== targetUID);
-  const target = users[targetUID];
+  const target = fixUser(users[targetUID]);
   if (target) target.contacts = target.contacts.filter(x => x !== myUID);
   res.json({ ok: true });
 });
 
 app.post('/api/unblock', (req, res) => {
   const { myUID, targetUID } = req.body;
-  const me = users[myUID];
+  const me = fixUser(users[myUID]);
   if (!me) return res.json({ ok: false });
   me.blocked = me.blocked.filter(x => x !== targetUID);
   res.json({ ok: true });
